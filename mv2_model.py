@@ -8,7 +8,6 @@ import os
 
 from matplotlib import pyplot as plt
 
-# 将项目根目录加入到 sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config as cfg
 torch.cuda.device(cfg.cuda)
@@ -16,19 +15,9 @@ torch.cuda.device(cfg.cuda)
 
 class MultiChannelFusion(nn.Module):
     def __init__(self, in_channels=5, mid_channels=64, out_channels=1, mode='all'):  # attn conv all avg
-        """
-        多通道融合模块
-        - mode: 支持 'attn'、'conv', 'all' 模式切换
-        模式 (mode)	说明	适合场景
-        'attn'	通道注意力融合（SE-like）	强调通道间权重关系，适合异构特征
-        'conv'	卷积交互融合（非注意力）	轻量级、结构简洁、稳定性好
-        'all'	注意力 + 卷积融合	最强表达力，适合性能为主的实验
-        None/默认	简单平均	快速对比基线
-        """
         super().__init__()
         self.mode = mode
 
-        # 通道注意力模块（适用于融合不同模态）
         self.channel_attn = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),                             # [B, C, 1, 1]
             nn.Conv2d(in_channels, mid_channels, 1),
@@ -37,7 +26,6 @@ class MultiChannelFusion(nn.Module):
             nn.Sigmoid()
         )
 
-        # 深度特征交互卷积（可选）
         self.cross_conv = nn.Sequential(
             nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(mid_channels),
@@ -45,24 +33,20 @@ class MultiChannelFusion(nn.Module):
             nn.Conv2d(mid_channels, out_channels, kernel_size=1)
         )
 
-        # 可选残差连接或直接映射
         self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
     def forward(self, feats):  # feats: [B, C=5, T, F]
         if self.mode == 'attn':
-            # 通道注意力融合
             attn_weights = self.channel_attn(feats)          # [B, C, 1, 1]
             fused = feats * attn_weights                     # Broadcast: [B, C, T, F]
             fused = torch.sum(fused, dim=1, keepdim=True)    # [B, 1, T, F]
 
         elif self.mode == 'conv':
-            # 卷积混合
             fused = self.cross_conv(feats)                   # [B, 1, T, F]
 
         elif self.mode == 'all':
             #plt_logmel = feats[0,0,:,:].squeeze(0).cpu().detach().numpy()
             #plt.imshow(plt_logmel, origin='lower', aspect='auto', cmap='jet'), plt.show(), plt.close()
-            # 双路融合 + 残差
             attn_weights = self.channel_attn(feats)
             attn_fused = feats * attn_weights
             attn_fused = torch.sum(attn_fused, dim=1, keepdim=True)
@@ -73,27 +57,16 @@ class MultiChannelFusion(nn.Module):
             #plt.imshow(plt_logmel, origin='lower', aspect='auto', cmap='jet'), plt.show(), plt.close()
 
         elif self.mode == 'avg':
-            # 简单平均
             fused = torch.mean(feats, dim=1, keepdim=True)
 
         else:
             fused = feats
 
-        return fused  # 输出形状：[B, 1, T, F]
+        return fused  # [B, 1, T, F]
 
 
 class AnomalyGen(nn.Module):
     def __init__(self, noise_std=0.1, patch_ratio=0.10, mode="gaussian", s=4, adaptive_noise=True, min_noise_std=0.02, size_threshold=32):
-        """
-        Args:
-            noise_std: 默认高斯噪声标准差 0.1  0.8
-            patch_ratio: patch 区域占比 0.10  0.70
-            mode: 扰动模式 ['gaussian', 'mask', 'permute']
-            s: 邻域大小
-            adaptive_noise: 是否根据输入尺寸自适应调整 noise_std
-            min_noise_std: 自适应时最小 noise_std  0.02  0.3
-            size_threshold: 小于这个 T/F 尺寸，开始缩减 noise_std
-        """
         super(AnomalyGen, self).__init__()
         self.noise_std = noise_std
         self.patch_ratio = patch_ratio
@@ -107,7 +80,7 @@ class AnomalyGen(nn.Module):
         B, C, T, F = x.shape
         anomaly_x = x.clone()
 
-        # 自适应 noise_std
+        # noise_std
         noise_std = self.noise_std
         if self.adaptive_noise:
             min_dim = min(T, F)
@@ -115,12 +88,12 @@ class AnomalyGen(nn.Module):
                 ratio = min_dim / self.size_threshold
                 noise_std = max(self.min_noise_std, self.noise_std * ratio)
 
-        # 计算 patch 尺寸，限制最大不超过当前特征图
+        # patch
         patch_area = int(T * F * self.patch_ratio)
         patch_h = max(1, min(int(patch_area ** 0.5), T // 2))
         patch_w = max(1, min(patch_area // patch_h, F // 2))
 
-        # 动态调整邻域 s
+        # s
         s = min(self.base_s, max(1, min(T // (2 * patch_h), F // (2 * patch_w))))
 
         if self.mode == "gaussian":
@@ -284,14 +257,14 @@ class MobileNetV2(nn.Module):  # model size 8.515MB
         if (self.learn_method == 'Contrastive') & (self.aug_method == 'anomalygen'):
             x_anomaly = self.anomalygen(x.clone())
             x = torch.cat([x, x_anomaly], dim=0)
-            #feat_x = x.clone()  # 临时 plt专用
+            #feat_x = x.clone()
         x = self.conv(x)
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
         if (self.learn_method == 'Contrastive') or (cfg.premodel_ext == 'True'):
             x1 = self.classifier(x)
-            return x1,x  # (分类概率结果，线性层前的特征)
-            #return feat_x, x  # 临时 plt专用
+            return x1,x
+            #return feat_x, x
         else:
             x = self.classifier(x)
             return x
@@ -316,104 +289,6 @@ def mobilenetv2(**kwargs):
     """
     return MobileNetV2(**kwargs)
 
-
-class SupConLoss(nn.Module):
-    """Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf.
-    It also supports the unsupervised contrastive loss in SimCLR"""
-    def __init__(self, temperature=0.07, contrast_mode='all',
-                 base_temperature=0.07):
-        super(SupConLoss, self).__init__()
-        self.temperature = temperature
-        self.contrast_mode = contrast_mode
-        self.base_temperature = base_temperature
-
-    def forward(self, features, labels=None, mask=None):
-        """Compute loss for model. If both `labels` and `mask` are None,
-        it degenerates to SimCLR unsupervised loss:
-        https://arxiv.org/pdf/2002.05709.pdf
-
-        Args:
-            features: hidden vector of shape [bsz, n_views, ...].
-            labels: ground truth of shape [bsz].
-            mask: contrastive mask of shape [bsz, bsz], mask_{i,j}=1 if sample j
-                has the same class as sample i. Can be asymmetric.
-        Returns:
-            A loss scalar.
-        """
-        device = (torch.device('cuda')
-                  if features.is_cuda
-                  else torch.device('cpu'))
-
-        if len(features.shape) < 3:
-            features = features.unsqueeze(1)
-            features = features.view(features.shape[0], features.shape[1], -1)
-            #raise ValueError('`features` needs to be [bsz, n_views, ...],''at least 3 dimensions are required')
-        if len(features.shape) > 3:
-            features = features.view(features.shape[0], features.shape[1], -1)
-
-        batch_size = features.shape[0]
-        if labels is not None and mask is not None:
-            raise ValueError('Cannot define both `labels` and `mask`')
-        elif labels is None and mask is None:
-            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
-        elif labels is not None:
-            labels = labels.contiguous().view(-1, 1)
-            if labels.shape[0] != batch_size:
-                raise ValueError('Num of labels does not match num of features')
-            mask = torch.eq(labels, labels.T).float().to(device)
-        else:
-            mask = mask.float().to(device)
-
-        contrast_count = features.shape[1]
-        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
-        if self.contrast_mode == 'one':
-            anchor_feature = features[:, 0]
-            anchor_count = 1
-        elif self.contrast_mode == 'all':
-            anchor_feature = contrast_feature
-            anchor_count = contrast_count
-        else:
-            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
-
-        # compute logits
-        anchor_dot_contrast = torch.div(
-            torch.matmul(anchor_feature, contrast_feature.T),
-            self.temperature)
-        # for numerical stability
-        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
-        logits = anchor_dot_contrast - logits_max.detach()
-
-        # tile mask
-        mask = mask.repeat(anchor_count, contrast_count)
-        # mask-out self-contrast cases
-        logits_mask = torch.scatter(
-            torch.ones_like(mask),
-            1,
-            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
-            0
-        )
-        mask = mask * logits_mask
-
-        # compute log_prob
-        exp_logits = torch.exp(logits) * logits_mask
-        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
-
-        # compute mean of log-likelihood over positive
-        # modified to handle edge cases when there is no positive pair
-        # for an anchor point.
-        # Edge case e.g.:-
-        # features of shape: [4,1,...]
-        # labels:            [0,1,1,2]
-        # loss before mean:  [nan, ..., ..., nan]
-        mask_pos_pairs = mask.sum(1)
-        mask_pos_pairs = torch.where(mask_pos_pairs < 1e-6, 1, mask_pos_pairs)
-        mean_log_prob_pos = (mask * log_prob).sum(1) / mask_pos_pairs
-
-        # loss
-        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
-        loss = loss.view(anchor_count, batch_size).mean()
-
-        return loss
 
 
 class AngularPenaltySMLoss(nn.Module):
@@ -477,8 +352,6 @@ class AngularPenaltySMLoss(nn.Module):
         return -torch.mean(L)
 
 class NTXent(nn.Module):
-    # adapted from https://github.com/clabrugere/pytorch-scarf/blob/master/scarf/loss.py but rewrite the loss to avoid
-    # explicit log(exp(.)) and log(sum(exp(.))) operations to improve numerical stability.
     def __init__(self, temperature=1.0):
         super().__init__()
         self.temperature = temperature
@@ -510,11 +383,9 @@ class NTXent(nn.Module):
 
 
 if __name__ == '__main__':
-    # 确保所有特征在同一设备上
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     batchsize = 8
     x = torch.randn(size=(batchsize, 1, 128, 128))
-    #models = AENet()
     model = MobileNetV2() # MobileNetV2()
     output_z = model(x)  # , output_recon
     print(f'input dim:{x.shape}. output_z dim:{output_z[1].shape}.')  #  output_recon dim:{output_recon.shape}
@@ -529,4 +400,5 @@ if __name__ == '__main__':
     num_params = sum(p.numel() for p in model_head.parameters())
     print(f"Number of parameters in the models: {num_params}")
     num_params = sum(p.numel() * p.element_size() for p in model_head.parameters())
+
     print(f"Number of parameters in bytes: {num_params}")
